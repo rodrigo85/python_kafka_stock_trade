@@ -1,0 +1,5 @@
+
+.env
+/backend/__pycache__
+/frontend/__pycache__
+/kafka/__pycache__
