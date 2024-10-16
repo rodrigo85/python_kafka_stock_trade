@@ -21,17 +21,17 @@ This project handles real-time stock orders from the frontend to the backend usi
     - The order is sent to a Kafka topic by the producer logic in [`kafka/producer.py`](./kafka/producer.py).
     - The `produce_message` function is responsible for sending the message to the Kafka topic: [`produce_message`](./kafka/producer.py#L10).
 
-3. **Backend (Order Matching Engine)**:
+3. **Kafka Consumer**:
+    - The Kafka consumer listens to the topic and processes matched orders, consuming messages from Kafka. The consumer logic is located in [`kafka/consumer.py`](./kafka/consumer.py).
+    - The function that handles this is [`consume_message`](./kafka/consumer.py#L12), which reads messages from Kafka topics.
+    - 
+4. **Backend (Order Matching Engine)**:
     - The order matching logic is implemented in the [`OrderBook` class](./backend/order_book.py#L9) in [`backend/order_book.py`](./backend/order_book.py).
     - Key functions that handle the order processing include:
         - [`add_order`](./backend/order_book.py#L21): Adds new buy or sell orders to the order book and triggers the matching process.
         - [`match_buy_order`](./backend/order_book.py#L43): Matches incoming buy orders with the lowest priced sell orders.
         - [`match_sell_order`](./backend/order_book.py#L68): Matches incoming sell orders with the highest priced buy orders.
     - The `OrderBook` class fetches active orders from the Cassandra database via the [`CassandraDB` class](./backend/cassandra_db.py#L10).
-
-4. **Kafka Consumer**:
-    - The Kafka consumer listens to the topic and processes matched orders, consuming messages from Kafka. The consumer logic is located in [`kafka/consumer.py`](./kafka/consumer.py).
-    - The function that handles this is [`consume_message`](./kafka/consumer.py#L12), which reads messages from Kafka topics.
 
 5. **Cassandra**:
     - Active orders, matched orders, and completed orders are stored in Cassandra. This is managed by the [`CassandraDB` class](./backend/cassandra_db.py#L10) in [`backend/cassandra_db.py`](./backend/cassandra_db.py).
