@@ -40,4 +40,4 @@ This project handles real-time stock orders from the frontend to the backend usi
         - [`move_to_completed_orders`](./backend/cassandra_db.py#L115): Moves fully processed orders into the `completed_orders` table.
 
 
-🎥 Watch a recorded test of the project in action [here](https://youtu.be/inrQesrC7e4?si=kgktBdoYRYxzMHZv).
+## 🎥 Watch a recorded test of the project in action [here](https://youtu.be/inrQesrC7e4?si=kgktBdoYRYxzMHZv).
