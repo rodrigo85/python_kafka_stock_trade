@@ -4,13 +4,14 @@ This project implements a real-time stock order matching system using Python, Ka
 
 The project simulates a fully operational order book for stock trading with features to track and log trade matches, ensuring accurate records of completed and historical trades.
 
-#### Key Features:
-- Real-time processing of stock buy/sell orders
-- Kafka for handling live streams of orders
-- Cassandra for storing active, completed, and historical orders
-- Python-based order matching logic
+#### 🛠️ Tools & Technologies
 
-## 🛠️ System Flow
+- ![Python](https://img.shields.io/badge/-Python-3776AB?logo=python&logoColor=white) **Python**: Used for the main logic to match buy and sell stock orders.
+- ![Apache Kafka](https://img.shields.io/badge/-Kafka-231F20?logo=apachekafka&logoColor=white) **Kafka**: Handles the real-time flow of stock orders, streaming live buy and sell requests to the system for immediate processing.
+- ![Cassandra](https://img.shields.io/badge/-Cassandra-1287B1?logo=apachecassandra&logoColor=white) **Cassandra**: Stores all the active, matched, and completed orders, so the data is organized and ready for later use.
+
+
+### ➡️ System Flow
 
 This project handles real-time stock orders from the frontend to the backend using the following components:
 
@@ -40,4 +41,4 @@ This project handles real-time stock orders from the frontend to the backend usi
         - [`move_to_completed_orders`](./backend/cassandra_db.py#L115): Moves fully processed orders into the `completed_orders` table.
 
 
-## 🎥 Watch a recorded test of the project in action [here](https://youtu.be/inrQesrC7e4?si=kgktBdoYRYxzMHZv).
+### 🎥 Watch a recorded test of the project in action [here](https://youtu.be/inrQesrC7e4?si=kgktBdoYRYxzMHZv).
