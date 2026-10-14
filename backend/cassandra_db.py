@@ -1,225 +1,306 @@
-from cassandra.cluster import Cluster
-from cassandra.util import ms_timestamp_from_datetime
-from backend.order import Order
+"""Cassandra database access layer for active orders, trade execution history, and completed orders."""
+
 from collections import defaultdict
-import uuid
 from datetime import datetime
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
+import uuid
+
+try:
+    from cassandra.cluster import Cluster, Session
+    from cassandra.util import ms_timestamp_from_datetime
+    HAS_CASSANDRA = True
+except ImportError:
+    HAS_CASSANDRA = False
+
+from backend.order import Order
+
+logger = logging.getLogger("CassandraDB")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
 
 class CassandraDB:
-    def __init__(self):
+    """Manages persistence of active orders, trade matches, and historical orders in Apache Cassandra."""
+
+    def __init__(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        keyspace: Optional[str] = None,
+        auto_connect: bool = True,
+    ) -> None:
+        self.host = host or os.getenv("CASSANDRA_HOST", "localhost")
+        self.port = port or int(os.getenv("CASSANDRA_PORT", 9042))
+        self.keyspace = keyspace or os.getenv("CASSANDRA_KEYSPACE", "stock_orders")
+        self.cluster: Optional[Any] = None
+        self.session: Optional[Any] = None
+
+        if auto_connect:
+            self.connect()
+
+    def connect(self, retries: int = 5, delay: float = 3.0) -> bool:
+        """Establish connection to Cassandra cluster with retry logic."""
+        if not HAS_CASSANDRA:
+            logger.warning("cassandra-driver not installed. CassandraDB operating in offline/mock mode.")
+            return False
+
+        for attempt in range(1, retries + 1):
+            try:
+                logger.info(f"Connecting to Cassandra at {self.host}:{self.port} (attempt {attempt}/{retries})...")
+                self.cluster = Cluster([self.host], port=self.port, connect_timeout=10)
+                self.session = self.cluster.connect()
+                self.create_keyspace()
+                self.create_tables()
+                logger.info(f"Successfully connected to Cassandra keyspace '{self.keyspace}'.")
+                return True
+            except Exception as e:
+                logger.warning(f"Connection attempt {attempt} failed: {e}")
+                if attempt < retries:
+                    time.sleep(delay)
+
+        logger.error(f"Could not connect to Cassandra after {retries} attempts.")
+        return False
+
+    def create_keyspace(self) -> None:
+        """Create the keyspace if it does not already exist."""
+        if not self.session:
+            return
+        query = f"""
+            CREATE KEYSPACE IF NOT EXISTS {self.keyspace}
+            WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '1'}};
         """
-        Initialize the CassandraDB connection and create the keyspace and tables.
-        Connects to a Cassandra cluster running on Docker.
-        """
-        try:
-            self.cluster = Cluster(['127.0.0.1'], port=9042)  # Connect to Cassandra running in Docker
-            self.session = self.cluster.connect()
-            self.create_keyspace()
-            self.create_tables()
-        except Exception as e:
-            print(f"Error initializing CassandraDB: {e}")
+        self.session.execute(query)
+        self.session.set_keyspace(self.keyspace)
 
-    def create_keyspace(self):
-        """Create the 'stock_orders' keyspace in Cassandra if it does not already exist."""
-        try:
-            self.session.execute("""
-                CREATE KEYSPACE IF NOT EXISTS stock_orders
-                WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}
-            """)
-            self.session.set_keyspace('stock_orders')
-        except Exception as e:
-            print(f"Error creating keyspace: {e}")
+    def create_tables(self) -> None:
+        """Create orders, order_history, and completed_orders tables."""
+        if not self.session:
+            return
 
-    def create_tables(self):
-        """Create the 'orders', 'order_history', and 'completed_orders' tables."""
-        try:
-            self.session.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
-                    stock_symbol TEXT,
-                    order_type TEXT,
-                    status TEXT,
-                    order_id UUID,
-                    user_id TEXT,
-                    price DOUBLE,
-                    original_quantity INT,
-                    quantity INT,
-                    timestamp TIMESTAMP,
-                    PRIMARY KEY ((stock_symbol, order_type, status), order_id)
-                );
-            """)
-            self.session.execute("""
-                CREATE TABLE IF NOT EXISTS order_history (
-                    match_id UUID PRIMARY KEY,
-                    buy_order_id UUID,
-                    sell_order_id UUID,
-                    stock_symbol TEXT,
-                    price DOUBLE,
-                    matched_quantity INT,
-                    match_timestamp TIMESTAMP
-                );
-            """)
-            self.session.execute("""
-                CREATE TABLE IF NOT EXISTS completed_orders (
-                    order_id UUID PRIMARY KEY,
-                    stock_symbol TEXT,
-                    order_type TEXT,
-                    user_id TEXT,
-                    price DOUBLE,
-                    original_quantity INT,
-                    quantity INT,
-                    completed_timestamp TIMESTAMP
-                );
-            """)
-        except Exception as e:
-            print(f"Error creating tables: {e}")
+        self.session.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                stock_symbol TEXT,
+                order_type TEXT,
+                status TEXT,
+                order_id UUID,
+                user_id TEXT,
+                price DOUBLE,
+                original_quantity INT,
+                quantity INT,
+                timestamp TIMESTAMP,
+                PRIMARY KEY ((stock_symbol, order_type, status), order_id)
+            );
+        """)
 
-    def get_current_timestamp(self):
-        """Get the current timestamp in milliseconds."""
-        return ms_timestamp_from_datetime(datetime.now())
+        self.session.execute("""
+            CREATE TABLE IF NOT EXISTS order_history (
+                match_id UUID PRIMARY KEY,
+                buy_order_id UUID,
+                sell_order_id UUID,
+                stock_symbol TEXT,
+                price DOUBLE,
+                matched_quantity INT,
+                match_timestamp TIMESTAMP
+            );
+        """)
 
-    def get_active_orders(self, stock_symbol, order_type):
+        self.session.execute("""
+            CREATE TABLE IF NOT EXISTS completed_orders (
+                order_id UUID PRIMARY KEY,
+                stock_symbol TEXT,
+                order_type TEXT,
+                user_id TEXT,
+                price DOUBLE,
+                original_quantity INT,
+                quantity INT,
+                completed_timestamp TIMESTAMP
+            );
+        """)
+
+    def get_current_timestamp(self) -> int:
+        """Return the current timestamp in milliseconds."""
+        if HAS_CASSANDRA:
+            return ms_timestamp_from_datetime(datetime.now())
+        return int(time.time() * 1000)
+
+    def get_active_orders(self, stock_symbol: str, order_type: str) -> List[Order]:
         """Fetch active buy or sell orders from Cassandra."""
-        orders = []
+        if not self.session:
+            return []
+
+        orders: List[Order] = []
         try:
             query = """
                 SELECT * FROM orders
                 WHERE stock_symbol = %s AND order_type = %s AND status = 'active';
             """
-            results = self.session.execute(query, (stock_symbol, order_type))
+            results = self.session.execute(query, (stock_symbol, order_type.lower()))
             for row in results:
                 orders.append(Order.from_dict(row))
         except Exception as e:
-            raise Exception(f"Error fetching active {order_type} orders from Cassandra: {e}")
+            logger.error(f"Error fetching active {order_type} orders for {stock_symbol}: {e}")
         return orders
 
-    def insert_order(self, order):        
-        """Insert a new order into the 'orders' table."""
-        if any(attr is None for attr in [
-            order.stock_symbol, order.order_type, order.status, order.order_id,
-            order.user_id, order.price, order.original_quantity, order.quantity, order.timestamp
-        ]):
-            raise ValueError("All fields must be populated and cannot be None.")
+    def insert_order(self, order: Order) -> None:
+        """Insert or update an active order in the 'orders' table."""
+        if not self.session:
+            return
 
         try:
+            order_uuid = uuid.UUID(order.order_id) if isinstance(order.order_id, str) else order.order_id
             query = """
-                INSERT INTO orders (order_id, stock_symbol, user_id, order_type, price, original_quantity, quantity, status, timestamp)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO orders (
+                    order_id, stock_symbol, user_id, order_type, price,
+                    original_quantity, quantity, status, timestamp
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             self.session.execute(query, (
-                uuid.UUID(order.order_id), order.stock_symbol, order.user_id, order.order_type,
-                order.price, order.original_quantity, order.quantity, order.status, self.get_current_timestamp()
+                order_uuid, order.stock_symbol, order.user_id, order.order_type,
+                order.price, order.original_quantity, order.quantity, order.status,
+                self.get_current_timestamp()
             ))
         except Exception as e:
-            raise Exception(f"Error inserting order: {e}")
+            logger.error(f"Error inserting order {order.order_id}: {e}")
+            raise
 
-    def update_order(self, order_id, stock_symbol, order_type, status, quantity):
-        """Update the quantity and status of an order."""
+    def update_order(self, order_id: str, stock_symbol: str, order_type: str, status: str, quantity: int) -> None:
+        """Update the remaining quantity of an active order."""
+        if not self.session:
+            return
+
         try:
+            order_uuid = uuid.UUID(order_id) if isinstance(order_id, str) else order_id
             query = """
                 UPDATE orders SET quantity = %s
-                WHERE stock_symbol = %s AND order_type = %s AND status = %s AND order_id = %s
+                WHERE stock_symbol = %s AND order_type = %s AND status = %s AND order_id = %s;
             """
-            self.session.execute(query, (
-                quantity, stock_symbol, order_type, status, uuid.UUID(order_id)
-            ))
+            self.session.execute(query, (quantity, stock_symbol, order_type.lower(), status, order_uuid))
         except Exception as e:
-            raise Exception(f"Error updating order: {e}")
+            logger.error(f"Error updating order {order_id}: {e}")
+            raise
 
-    def move_to_history(self, buy_order, sell_order, matched_quantity, matched_price):
-        """Move matched orders to the 'order_history' table."""
-        timestamp_in_ms = self.get_current_timestamp()
+    def move_to_history(self, buy_order: Order, sell_order: Order, matched_quantity: int, matched_price: float) -> uuid.UUID:
+        """Record matched execution in 'order_history' and update remaining order quantities."""
+        match_id = uuid.uuid4()
+        if not self.session:
+            return match_id
+
         try:
+            timestamp_in_ms = self.get_current_timestamp()
+            buy_uuid = uuid.UUID(buy_order.order_id) if isinstance(buy_order.order_id, str) else buy_order.order_id
+            sell_uuid = uuid.UUID(sell_order.order_id) if isinstance(sell_order.order_id, str) else sell_order.order_id
+
             query = """
-                INSERT INTO order_history (match_id, buy_order_id, sell_order_id, stock_symbol, price, matched_quantity, match_timestamp)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO order_history (
+                    match_id, buy_order_id, sell_order_id, stock_symbol,
+                    price, matched_quantity, match_timestamp
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
             """
             self.session.execute(query, (
-                uuid.uuid4(), uuid.UUID(buy_order.order_id), uuid.UUID(sell_order.order_id),
+                match_id, buy_uuid, sell_uuid,
                 buy_order.stock_symbol, matched_price, matched_quantity, timestamp_in_ms
             ))
 
-            # Update orders in 'orders' table based on remaining quantities
-            if buy_order.quantity - matched_quantity == 0:
+            # Handle Buy order state transition
+            if buy_order.quantity - matched_quantity <= 0:
                 self.move_to_completed_orders(buy_order)
             else:
-                self.update_order(buy_order.order_id, buy_order.stock_symbol, 'buy', 'active', buy_order.quantity - matched_quantity)
+                self.update_order(
+                    buy_order.order_id, buy_order.stock_symbol, 'buy', 'active',
+                    buy_order.quantity - matched_quantity
+                )
 
-            if sell_order.quantity - matched_quantity == 0:
+            # Handle Sell order state transition
+            if sell_order.quantity - matched_quantity <= 0:
                 self.move_to_completed_orders(sell_order)
             else:
-                self.update_order(sell_order.order_id, sell_order.stock_symbol, 'sell', 'active', sell_order.quantity - matched_quantity)
+                self.update_order(
+                    sell_order.order_id, sell_order.stock_symbol, 'sell', 'active',
+                    sell_order.quantity - matched_quantity
+                )
 
+            return match_id
         except Exception as e:
-            raise Exception(f"Error moving orders to history: {e}")
+            logger.error(f"Error recording match to history: {e}")
+            raise
 
-    def move_to_completed_orders(self, order):
-        """Move a completed order to the 'completed_orders' table."""
+    def move_to_completed_orders(self, order: Order) -> None:
+        """Move a fully filled order to 'completed_orders' and delete it from 'orders'."""
+        if not self.session:
+            return
+
         try:
-            query = """
-                INSERT INTO completed_orders (order_id, stock_symbol, order_type, user_id, price, original_quantity, quantity, completed_timestamp)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """            
-            self.session.execute(query, (
-                uuid.UUID(order.order_id), order.stock_symbol, order.order_type, order.user_id,
+            order_uuid = uuid.UUID(order.order_id) if isinstance(order.order_id, str) else order.order_id
+
+            insert_query = """
+                INSERT INTO completed_orders (
+                    order_id, stock_symbol, order_type, user_id, price,
+                    original_quantity, quantity, completed_timestamp
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            self.session.execute(insert_query, (
+                order_uuid, order.stock_symbol, order.order_type, order.user_id,
                 order.price, order.original_quantity, 0, datetime.now()
-            ))            
-            # Remove the order from the 'orders' table
+            ))
+
             delete_query = """
-                DELETE FROM orders WHERE stock_symbol = %s AND order_type = %s AND status = 'active' AND order_id = %s
-            """            
-            self.session.execute(delete_query, (order.stock_symbol, order.order_type, uuid.UUID(order.order_id)))            
+                DELETE FROM orders
+                WHERE stock_symbol = %s AND order_type = %s AND status = 'active' AND order_id = %s
+            """
+            self.session.execute(delete_query, (order.stock_symbol, order.order_type.lower(), order_uuid))
         except Exception as e:
-            raise Exception(f"Error moving order to completed_orders: {e}")
+            logger.error(f"Error moving order {order.order_id} to completed_orders: {e}")
+            raise
 
-    def sum_quantity_by_price(self, stock_symbol):
-        """
-        Fetch and aggregate the quantities of buy and sell orders by price for a given stock symbol.
-        
-        Args:
-            stock_symbol (str): The stock symbol to fetch data for.
+    def sum_quantity_by_price(self, stock_symbol: str) -> Tuple[Dict[float, int], Dict[float, int]]:
+        """Fetch and aggregate the quantities of active buy and sell orders by price for Level 2 depth."""
+        buy_data: Dict[float, int] = defaultdict(int)
+        sell_data: Dict[float, int] = defaultdict(int)
 
-        Returns:
-            tuple: Two defaultdicts containing aggregated buy and sell quantities by price.
-        """
-        buy_data = defaultdict(int)
-        sell_data = defaultdict(int)
+        if not self.session:
+            return buy_data, sell_data
+
         try:
-            # Query for buy orders
             buy_query = """
                 SELECT price, quantity FROM orders 
                 WHERE stock_symbol = %s AND order_type = 'buy' AND status = 'active';
             """
-            buy_results = self.session.execute(buy_query, (stock_symbol,))
-            for row in buy_results:
+            for row in self.session.execute(buy_query, (stock_symbol,)):
                 buy_data[row.price] += row.quantity
-            
-            # Query for sell orders
+
             sell_query = """
                 SELECT price, quantity FROM orders 
                 WHERE stock_symbol = %s AND order_type = 'sell' AND status = 'active';
             """
-            sell_results = self.session.execute(sell_query, (stock_symbol,))
-            for row in sell_results:
+            for row in self.session.execute(sell_query, (stock_symbol,)):
                 sell_data[row.price] += row.quantity
-        
+
         except Exception as e:
-            raise Exception(f"Error fetching data from Cassandra: {e}")
+            logger.error(f"Error aggregating depth data from Cassandra for {stock_symbol}: {e}")
 
         return buy_data, sell_data
 
-    def close(self):
-        """Close the Cassandra session and cluster connection."""
+    def close(self) -> None:
+        """Close Cassandra connection cleanly."""
         try:
-            self.session.shutdown()
-            self.cluster.shutdown()
+            if self.session:
+                self.session.shutdown()
+            if self.cluster:
+                self.cluster.shutdown()
+            logger.info("Cassandra session and cluster shutdown successfully.")
         except Exception as e:
-            print(f"Error closing Cassandra connection: {e}")
+            logger.error(f"Error closing Cassandra connection: {e}")
 
-    def truncate_tables(self):
-        """Truncate orders and order_history tables to clear all data."""
+    def truncate_tables(self) -> None:
+        """Clear all active and historical orders (useful for test resets)."""
+        if not self.session:
+            return
         try:
             self.session.execute("TRUNCATE orders;")
             self.session.execute("TRUNCATE order_history;")
-            print("Truncated orders and order_history tables successfully.")
+            self.session.execute("TRUNCATE completed_orders;")
+            logger.info("Truncated orders, order_history, and completed_orders tables.")
         except Exception as e:
-            print(f"Error truncating tables: {e}")
+            logger.error(f"Error truncating tables: {e}")

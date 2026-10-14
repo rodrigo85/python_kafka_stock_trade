@@ -1,83 +1,110 @@
-from confluent_kafka import Consumer, KafkaError
+"""Kafka consumer service that processes incoming orders and executes the matching engine."""
+
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from typing import Any, Optional
+from dotenv import load_dotenv
+
+try:
+    from confluent_kafka import Consumer, KafkaError
+    HAS_KAFKA = True
+except ImportError:
+    HAS_KAFKA = False
+
+from backend.cassandra_db import CassandraDB
 from backend.order import Order
 from backend.order_book import OrderBook
-from backend.cassandra_db import CassandraDB
-from dotenv import load_dotenv
-import json
-import os
+from kafka.producer import send_matched_trade
 
 load_dotenv()
 
-KAFKA_BROKER = os.getenv('KAFKA_BROKER', 'localhost:29092')
+logger = logging.getLogger("OrderConsumer")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-# Initialize CassandraDB and OrderBook
-db = CassandraDB()
-order_book = OrderBook(db)
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:29092")
+CONSUMER_GROUP = os.getenv("KAFKA_CONSUMER_GROUP", "order_matching_engine_group")
 
-consumer = Consumer({
-    'bootstrap.servers': KAFKA_BROKER,
-    'group.id': 'order_group',
-    'auto.offset.reset': 'earliest'
-})
+running = True
 
-consumer.subscribe(['buy_orders', 'sell_orders'])
 
-def consume_orders():
-    """
-    Polls messages from Kafka topics 'buy_orders' and 'sell_orders'.
-    Each message is processed, converting it into an Order object and adding it to the order book.
-    If an order matches with another, it is processed and the match is recorded.
-    """
-    while True:
-        msg = consumer.poll(1.0)
+def signal_handler(sig: int, frame: Any) -> None:
+    """Handle graceful shutdown signals."""
+    global running
+    logger.info("Shutdown signal received. Closing consumer...")
+    running = False
 
-        if msg is None:
-            continue
-        
-        if msg.error():
-            if msg.error().code() == KafkaError._PARTITION_EOF:
-                continue
-            else:
-                print(f"Error: {msg.error()}")
-                break
 
-        try:
-            order_data = json.loads(msg.value().decode('utf-8'))
-            print(f"Consumed message: {order_data}")
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
-            # Create Order instance
-            order = Order(
-                order_id=order_data['order_id'],
-                price=order_data['price'],
-                stock_symbol=order_data['stock_id'],
-                original_quantity=order_data['quantity'],
-                quantity=order_data['quantity'], 
-                order_type=order_data['order_type'],
-                user_id=order_data['user_id'],
-                status="active"
-            )
-            #order_book.add_order(order)
 
-            if order.order_type == 'sell':
-                order_book.match_sell_order(order)
-            else:            
-                order_book.match_buy_order(order)
+def init_engine() -> tuple[CassandraDB, OrderBook]:
+    """Initialize Cassandra connection and OrderBook instance with trade event callback."""
+    db = CassandraDB(auto_connect=True)
+    order_book = OrderBook(db=db, trade_callback=send_matched_trade)
+    return db, order_book
 
-        except json.JSONDecodeError as json_err:
-            print(f"JSON decoding error: {json_err}")
 
-        except KafkaError as kafka_err:
-            print(f"Kafka consumer error: {kafka_err}")
+def consume_orders() -> None:
+    """Main consumer event loop polling buy and sell orders from Kafka."""
+    if not HAS_KAFKA:
+        logger.error("confluent-kafka not installed. Consumer cannot run.")
+        return
 
-        except KeyError as key_err:
-            print(f"Missing expected field: {key_err}")
+    db, order_book = init_engine()
 
-        except Exception as e:            
-            print(f"An unexpected error occurred: {e}")
+    conf = {
+        "bootstrap.servers": KAFKA_BROKER,
+        "group.id": CONSUMER_GROUP,
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": True,
+    }
 
-if __name__ == '__main__':    
+    consumer = Consumer(conf)
+    topics = ["buy_orders", "sell_orders"]
+
+    logger.info(f"Subscribing to topics: {topics} at broker: {KAFKA_BROKER}")
+    consumer.subscribe(topics)
+
+    logger.info("Order Matching Engine is ready and polling for orders...")
     try:
-        consume_orders()
+        while running:
+            msg = consumer.poll(timeout=1.0)
+            if msg is None:
+                continue
+
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                logger.error(f"Kafka error encountered: {msg.error()}")
+                continue
+
+            try:
+                raw_val = msg.value().decode("utf-8")
+                order_data = json.loads(raw_val)
+                logger.info(f"Received {msg.topic()} message: {order_data}")
+
+                order = Order.from_dict(order_data)
+                executed_trades = order_book.add_order(order)
+
+                if executed_trades:
+                    logger.info(f"Executed {len(executed_trades)} trade(s) for order {order.order_id}")
+
+            except json.JSONDecodeError as err:
+                logger.error(f"Malformed JSON in Kafka message: {err}")
+            except Exception as err:
+                logger.error(f"Unexpected error processing order: {err}", exc_info=True)
+
     finally:
+        logger.info("Closing Kafka consumer and database connections...")
         consumer.close()
         db.close()
+        logger.info("Shutdown complete.")
+
+
+if __name__ == "__main__":
+    consume_orders()

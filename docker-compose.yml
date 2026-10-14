@@ -1,19 +1,29 @@
 services:
+  # ============================================================================
+  # 1. Zookeeper (Kafka Coordination)
+  # ============================================================================
   zookeeper:
-    image: confluentinc/cp-zookeeper:latest
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: stock_zookeeper
+    restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     networks:
-      - broker-kafka
+      - stock-net
 
+  # ============================================================================
+  # 2. Apache Kafka Broker
+  # ============================================================================
   kafka:
-    image: confluentinc/cp-kafka:latest
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: stock_kafka
+    restart: unless-stopped
     depends_on:
       - zookeeper
     ports:
-      - "9092:9092" # Internal Docker network access
-      - "29092:29092" # External access from localhost
+      - "9092:9092"   # Internal Docker network
+      - "29092:29092" # External host access
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -22,38 +32,138 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
-      - broker-kafka
-    volumes:
-      - ./create_kafka_topics.sh:/usr/bin/create_kafka_topics.sh
-    command: >
-      sh -c "/etc/confluent/docker/run &
-             /usr/bin/create_kafka_topics.sh &&
-             tail -f /dev/null"
+      - stock-net
 
+  # ============================================================================
+  # 3. Kafka Topics Initializer (Idempotent Setup)
+  # ============================================================================
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: stock_kafka_init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./create_kafka_topics.sh:/usr/bin/create_kafka_topics.sh:ro
+    entrypoint: ["/bin/bash", "/usr/bin/create_kafka_topics.sh"]
+    networks:
+      - stock-net
+
+  # ============================================================================
+  # 4. Apache Cassandra NoSQL Database
+  # ============================================================================
+  cassandra:
+    image: cassandra:4.1
+    container_name: stock_cassandra
+    restart: unless-stopped
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: "StockTradingCluster"
+      CASSANDRA_DC: "datacenter1"
+      CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES;' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 40s
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    networks:
+      - stock-net
+
+  # ============================================================================
+  # 5. Cassandra Schema Initializer (Creates Keyspace & Tables)
+  # ============================================================================
+  cassandra-init:
+    image: cassandra:4.1
+    container_name: stock_cassandra_init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./scripts/init_cassandra.cql:/init_cassandra.cql:ro
+    entrypoint: ["/bin/bash", "-c", "echo 'Applying Cassandra schema...' && cqlsh cassandra 9042 -f /init_cassandra.cql && echo 'Cassandra schema initialized.'"]
+    networks:
+      - stock-net
+
+  # ============================================================================
+  # 6. Kafdrop (Kafka Web UI Monitor)
+  # ============================================================================
   kafdrop:
     image: obsidiandynamics/kafdrop:latest
-    networks:
-      - broker-kafka
+    container_name: stock_kafdrop
+    restart: unless-stopped
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
-      - 19000:9000
+      - "19000:9000"
     environment:
       KAFKA_BROKERCONNECT: kafka:9092
+    networks:
+      - stock-net
 
-  python-app:
-    build: ./python-app
+  # ============================================================================
+  # 7. Order Matching Engine (Kafka Consumer & Matcher)
+  # ============================================================================
+  order-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stock_order_engine
+    restart: unless-stopped
     depends_on:
-      - kafka
+      kafka-init:
+        condition: service_completed_successfully
+      cassandra-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BROKER: kafka:9092
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_PORT: 9042
+    command: python kafka/consumer.py
     networks:
-      - broker-kafka
-    volumes:
-      - ./python-app:/app
-    command: python consumer.py
+      - stock-net
+
+  # ============================================================================
+  # 8. Trading Dashboard Web UI (Dash & Plotly)
+  # ============================================================================
+  trading-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stock_trading_dashboard
+    restart: unless-stopped
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      cassandra-init:
+        condition: service_completed_successfully
+    ports:
+      - "8050:8050"
+    environment:
+      KAFKA_BROKER: kafka:9092
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_PORT: 9042
+      DASH_HOST: "0.0.0.0"
+      DASH_PORT: "8050"
+    command: python frontend/app.py
+    networks:
+      - stock-net
 
 networks:
-  broker-kafka:
+  stock-net:
     driver: bridge
+
+volumes:
+  cassandra_data:
+    driver: local

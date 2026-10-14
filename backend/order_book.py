@@ -1,174 +1,241 @@
-from collections import defaultdict
-import heapq as hq
+"""Order matching engine implementing price-time priority (FIFO) execution."""
+
+from collections import defaultdict, deque
+import json
+import logging
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import uuid
+
 from backend.order import Order
-from backend.cassandra_db import CassandraDB
-from collections import deque
+
+logger = logging.getLogger("OrderBook")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
 
 class OrderBook:
-    def __init__(self, db):
-        # Buy orders sorted by descending price
-        self.buy_orders = deque()
-        # Sell orders sorted by ascending price
-        self.sell_orders = deque()
+    """In-memory Level 2 Order Book with Price-Time Priority matching and Cassandra persistence."""
+
+    def __init__(
+        self,
+        db: Optional[Any] = None,
+        default_symbol: str = "AAPL",
+        trade_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> None:
         self.db = db
-        self.load_active_orders("AAPL")
-        
-    def get_active_orders(self, stock_symbol):
-        """Fetch active buy and sell orders from the database."""
-        # Use the CassandraDB instance to get active orders
-        buy_orders = self.db.get_active_orders(stock_symbol, 'buy')
-        sell_orders = self.db.get_active_orders(stock_symbol, 'sell')
-        return buy_orders, sell_orders
+        self.default_symbol = default_symbol
+        self.trade_callback = trade_callback
 
-    def load_active_orders(self, stock_symbol):
-        """Load active buy and sell orders from the database."""
-        # Load active buy orders
-        buy_orders = self.db.get_active_orders(stock_symbol, 'buy')
-        # Load active sell orders
-        sell_orders = self.db.get_active_orders(stock_symbol, 'sell')
-        
-        # Sort buy orders by price descending, and sell orders by price ascending
-        self.buy_orders = deque(sorted(buy_orders, key=lambda x: -x.price))        
-        self.sell_orders = deque(sorted(sell_orders, key=lambda x: x.price))
+        # Buy orders: sorted descending by price, then ascending by timestamp (FIFO)
+        self.buy_orders: deque[Order] = deque()
+        # Sell orders: sorted ascending by price, then ascending by timestamp (FIFO)
+        self.sell_orders: deque[Order] = deque()
 
+        if self.db and hasattr(self.db, "session") and self.db.session:
+            self.load_active_orders(self.default_symbol)
 
-    def add_order(self, order: Order):
-        """Add a new order to the order book and try to match it."""
-        if order.order_type == 'buy':
-            self.match_buy_order(order)
-        elif order.order_type == 'sell':
-            self.match_sell_order(order)
+    def load_active_orders(self, stock_symbol: str) -> None:
+        """Load resting active orders from the database into the in-memory queues."""
+        if not self.db:
+            return
 
-    def match_sell_order(self, sell_order):
-        """Try to match a sell order with the highest priced buy orders.""" 
-        print(sell_order)       
-        while sell_order.quantity > 0 and self.buy_orders:            
-            # Get the highest-priced buy order
-            buy_order = self.buy_orders[0]
-            print(buy_order)
-            # If the buy price is lower than the sell price, stop matching
-            if buy_order.price < sell_order.price:
-                break
+        try:
+            buy_orders = self.db.get_active_orders(stock_symbol, "buy")
+            sell_orders = self.db.get_active_orders(stock_symbol, "sell")
 
-            # Determine the quantity that can be matched            
-            
-            trade_quantity = min(buy_order.quantity, sell_order.quantity)
-            
-            # Record the match
-            self.db.move_to_history(buy_order, sell_order, trade_quantity, buy_order.price)
+            # Sort buys: highest price first, then earliest arrival (FIFO)
+            self.buy_orders = deque(sorted(buy_orders, key=lambda o: (-o.price, o.timestamp)))
+            # Sort sells: lowest price first, then earliest arrival (FIFO)
+            self.sell_orders = deque(sorted(sell_orders, key=lambda o: (o.price, o.timestamp)))
 
-            # Update quantities
-            buy_order.quantity -= trade_quantity
-            sell_order.quantity -= trade_quantity
+            logger.info(
+                f"Loaded active orders for {stock_symbol}: {len(self.buy_orders)} buys, {len(self.sell_orders)} sells."
+            )
+        except Exception as e:
+            logger.warning(f"Could not load active orders from database: {e}")
 
-            # If the buy order is fully matched, remove it from the queue
-            if buy_order.quantity == 0:
-                self.buy_orders.popleft()
+    def add_order(self, order: Order) -> List[Dict[str, Any]]:
+        """Add an incoming order to the order book and execute matching."""
+        if order.order_type == "buy":
+            return self.match_buy_order(order)
+        elif order.order_type == "sell":
+            return self.match_sell_order(order)
+        else:
+            raise ValueError(f"Unknown order type '{order.order_type}'")
 
-        # If there's any remaining quantity, add the sell order back to the queue
-        if sell_order.quantity > 0:            
-            self.insert_sorted(self.sell_orders, sell_order, ascending=True)
-            self.db.insert_order(sell_order)
-        else:            
-            # Insert into completed orders if fully matched
-            self.db.move_to_completed_orders(sell_order)
-        
+    def match_buy_order(self, buy_order: Order) -> List[Dict[str, Any]]:
+        """Match an incoming buy order against resting sell orders (lowest ask price)."""
+        executed_trades: List[Dict[str, Any]] = []
 
-    def match_buy_order(self, buy_order):
-        """Try to match a buy order with the lowest priced sell orders."""
-        print(buy_order)   
         while buy_order.quantity > 0 and self.sell_orders:
-            # Get the lowest-priced sell order
-            sell_order = self.sell_orders[0]
-            print(sell_order)       
-            # If the sell price is higher than the buy price, stop matching
-            if sell_order.price > buy_order.price:
+            resting_sell = self.sell_orders[0]
+
+            # Price check: buyer must be willing to pay at least the sell price
+            if buy_order.price < resting_sell.price:
                 break
 
-            # Determine the quantity that can be matched
-            trade_quantity = min(sell_order.quantity, buy_order.quantity)
+            # Execution occurs at the resting order's price (standard exchange price-improvement rule)
+            trade_price = resting_sell.price
+            trade_qty = min(buy_order.quantity, resting_sell.quantity)
 
-            # Record the match
-            self.db.move_to_history(buy_order, sell_order, trade_quantity, sell_order.price)
+            # Record match
+            match_event = self._record_trade(buy_order, resting_sell, trade_qty, trade_price)
+            executed_trades.append(match_event)
 
-            # Update quantities
-            sell_order.quantity -= trade_quantity
-            buy_order.quantity -= trade_quantity
+            # Deduct quantities
+            buy_order.quantity -= trade_qty
+            resting_sell.quantity -= trade_qty
 
-            # If the sell order is fully matched, remove it from the queue
-            if sell_order.quantity == 0:
+            # If resting sell is completely filled, pop it from the book
+            if resting_sell.quantity == 0:
                 self.sell_orders.popleft()
 
-        # If there's any remaining quantity, add the buy order back to the queue
+        # If buy order has remaining unfilled quantity, insert it into resting buy queue
         if buy_order.quantity > 0:
-            print('Remaining quantity after matching, inserting back into queue...')            
-            self.insert_sorted(self.buy_orders, buy_order, ascending=False)
-            # Update the remaining buy order in the database
-            self.db.insert_order(buy_order)
-        else:
-            print('Buy order fully matched, moving to completed orders...')            
-            # Insert into completed orders if fully matched
+            self._insert_sorted(self.buy_orders, buy_order, is_buy=True)
+            if self.db:
+                self.db.insert_order(buy_order)
+        elif self.db:
             self.db.move_to_completed_orders(buy_order)
-        print('End of matching process')
 
+        return executed_trades
 
-    def get_order_rows(self):
-        """Get the formatted order rows for both buy and sell orders."""
-        order_rows = []
-        
-        # Process sell orders first (ascending)
-        for sell_order in self.sell_orders:
-            order_rows.append({
-                'buy_qty': '',
-                'price': sell_order.price,
-                'sell_qty': sell_order.quantity
-            })
+    def match_sell_order(self, sell_order: Order) -> List[Dict[str, Any]]:
+        """Match an incoming sell order against resting buy orders (highest bid price)."""
+        executed_trades: List[Dict[str, Any]] = []
 
-        # Process buy orders (descending)
-        for buy_order in self.buy_orders:
-            order_rows.append({
-                'buy_qty': buy_order.quantity,
-                'price': buy_order.price,
-                'sell_qty': ''
-            })
+        while sell_order.quantity > 0 and self.buy_orders:
+            resting_buy = self.buy_orders[0]
+
+            # Price check: seller's price must be at or below resting bid price
+            if sell_order.price > resting_buy.price:
+                break
+
+            # Execution occurs at the resting order's price
+            trade_price = resting_buy.price
+            trade_qty = min(sell_order.quantity, resting_buy.quantity)
+
+            # Record match
+            match_event = self._record_trade(resting_buy, sell_order, trade_qty, trade_price)
+            executed_trades.append(match_event)
+
+            # Deduct quantities
+            sell_order.quantity -= trade_qty
+            resting_buy.quantity -= trade_qty
+
+            # If resting buy is completely filled, pop it from the book
+            if resting_buy.quantity == 0:
+                self.buy_orders.popleft()
+
+        # If sell order has remaining unfilled quantity, insert it into resting sell queue
+        if sell_order.quantity > 0:
+            self._insert_sorted(self.sell_orders, sell_order, is_buy=False)
+            if self.db:
+                self.db.insert_order(sell_order)
+        elif self.db:
+            self.db.move_to_completed_orders(sell_order)
+
+        return executed_trades
+
+    def _record_trade(
+        self, buy_order: Order, sell_order: Order, trade_qty: int, trade_price: float
+    ) -> Dict[str, Any]:
+        """Record trade match to persistence, invoke callbacks, and emit event."""
+        match_id = str(uuid.uuid4())
+        trade_event = {
+            "match_id": match_id,
+            "buy_order_id": buy_order.order_id,
+            "sell_order_id": sell_order.order_id,
+            "stock_symbol": buy_order.stock_symbol,
+            "price": trade_price,
+            "matched_quantity": trade_qty,
+            "timestamp": buy_order.timestamp,
+        }
+
+        logger.info(
+            f"TRADE MATCH [{buy_order.stock_symbol}]: {trade_qty} shares @ ${trade_price:.2f} "
+            f"(Buyer: {buy_order.user_id}, Seller: {sell_order.user_id})"
+        )
+
+        if self.db:
+            try:
+                self.db.move_to_history(buy_order, sell_order, trade_qty, trade_price)
+            except Exception as e:
+                logger.error(f"Failed to persist trade {match_id} to database: {e}")
+
+        if self.trade_callback:
+            try:
+                self.trade_callback(trade_event)
+            except Exception as e:
+                logger.error(f"Error executing trade callback: {e}")
+
+        return trade_event
+
+    def _insert_sorted(self, queue: deque[Order], order: Order, is_buy: bool) -> None:
+        """Insert order maintaining Price-Time Priority (FIFO for equal prices)."""
+        idx = 0
+        while idx < len(queue):
+            current = queue[idx]
+            if is_buy:
+                # Buys: Higher price has priority. On equal price, earlier timestamp has priority.
+                if order.price > current.price or (
+                    order.price == current.price and order.timestamp < current.timestamp
+                ):
+                    break
+            else:
+                # Sells: Lower price has priority. On equal price, earlier timestamp has priority.
+                if order.price < current.price or (
+                    order.price == current.price and order.timestamp < current.timestamp
+                ):
+                    break
+            idx += 1
+
+        queue.insert(idx, order)
+
+    def get_order_rows(self) -> List[Dict[str, Any]]:
+        """Return formatted order book queue rows for UI table rendering."""
+        order_rows: List[Dict[str, Any]] = []
+
+        # Sell asks (ascending price)
+        for sell in self.sell_orders:
+            order_rows.append({"buy_qty": "", "price": sell.price, "sell_qty": sell.quantity})
+
+        # Buy bids (descending price)
+        for buy in self.buy_orders:
+            order_rows.append({"buy_qty": buy.quantity, "price": buy.price, "sell_qty": ""})
 
         return order_rows
-    
 
-    def insert_sorted(self, order_queue, order, ascending=True):
-        """Insert an order into the queue while maintaining sorted order."""
-        try:
-            # Ensure the order and its price are valid
-            if order is None or order.price is None:
-                raise ValueError("Order or order price cannot be None")
+    def sum_quantity_by_price(self, stock_symbol: str) -> Tuple[Dict[float, int], Dict[float, int]]:
+        """Return aggregated buy and sell depth for market depth charts."""
+        if self.db and hasattr(self.db, "session") and self.db.session:
+            return self.db.sum_quantity_by_price(stock_symbol)
 
-            index = 0
-            while index < len(order_queue):
-                # Ensure the current order in the queue has a valid price
-                if not hasattr(order_queue[index], 'price') or order_queue[index].price is None:
-                    raise ValueError(f"Invalid price in the queue at index {index}")
+        # Fallback to in-memory order book aggregation
+        buy_data: Dict[float, int] = defaultdict(int)
+        sell_data: Dict[float, int] = defaultdict(int)
 
-                # Insert based on the sorted order
-                if (ascending and order.price < order_queue[index].price) or \
-                (not ascending and order.price > order_queue[index].price):
-                    break
-                index += 1
+        for buy in self.buy_orders:
+            if buy.stock_symbol == stock_symbol:
+                buy_data[buy.price] += buy.quantity
 
-            # Insert the order at the correct position
-            order_queue.insert(index, order)
+        for sell in self.sell_orders:
+            if sell.stock_symbol == stock_symbol:
+                sell_data[sell.price] += sell.quantity
 
-        except ValueError as ve:
-            raise Exception(f"ValueError: {ve}")
-        except TypeError as te:
-            raise Exception(f"TypeError: {te}")
-        except Exception as e:
-            raise Exception(f"Unexpected error: {e}")
+        return buy_data, sell_data
+
+    def clear(self) -> None:
+        """Reset internal in-memory order queues."""
+        self.buy_orders.clear()
+        self.sell_orders.clear()
 
 
-    def sum_quantity_by_price(self, stock_symbol: str):
-        """Get quantity by price for both buy and sell orders from Cassandra."""
-        return self.db.sum_quantity_by_price(stock_symbol)
+# Default singleton instance (lazily configured, safe for imports)
+_default_db = None
+try:
+    from backend.cassandra_db import CassandraDB
+    _default_db = CassandraDB(auto_connect=False)
+except Exception:
+    pass
 
-    
-db = CassandraDB()
-order_book = OrderBook(db)
+order_book = OrderBook(_default_db)

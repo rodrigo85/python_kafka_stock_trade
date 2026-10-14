@@ -1,0 +1,7 @@
+# Core production runtime dependencies
+dash>=2.14.0
+plotly>=5.18.0
+confluent-kafka>=2.3.0
+cassandra-driver>=3.29.0
+python-dotenv>=1.0.0
+pydantic>=2.5.0
