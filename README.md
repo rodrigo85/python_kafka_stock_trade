@@ -337,6 +337,30 @@ make down        # Linux/macOS
 
 ---
 
+## 🛡 Automated Testing Suite Breakdown
+
+The repository includes a comprehensive automated test suite with 100% pass rate across 15 tests (`python -m pytest tests -v`):
+
+| Test File | Test Case | Functionality Verified |
+| :--- | :--- | :--- |
+| **`test_order.py`** | `test_valid_buy_order` | Validates limit buy order attributes, defaults, and UUID generation |
+| | `test_valid_sell_order` | Validates limit sell order attributes and case normalization |
+| | `test_invalid_order_type_raises_error` | Enforces strict validation rejecting unsupported order types |
+| | `test_zero_or_negative_price_raises_error` | Financial guard rejecting zero or negative limit prices |
+| | `test_negative_quantity_raises_error` | Financial guard rejecting negative share quantities |
+| | `test_serialization_to_and_from_dict` | Round-trip conversion between Order instances, dicts, and Cassandra rows |
+| **`test_order_book.py`** | `test_no_match_when_spread_not_crossed` | Uncrossed bid/ask spread (Bid < Ask) rests in order book without execution |
+| | `test_exact_match` | Exact match (Buy 100 @ 150 vs Sell 100 @ 150) executes and clears both queues |
+| | `test_partial_fill_buy_order_remaining` | Partial fill: 40 filled, remaining 60 stays resting at head of buy book |
+| | `test_partial_fill_sell_order_remaining` | Partial fill: 50 filled, remaining 70 stays resting at head of sell book |
+| | `test_price_improvement_executes_at_resting_price` | Aggressive buyer ($155) matches against resting seller ($150) at $150 |
+| | `test_price_time_priority_fifo` | Strict FIFO: earlier timestamp order at same price executes first |
+| | `test_multiple_price_levels_depth_sweep` | Large market order sweeps liquidity across multiple price tiers |
+| | `test_sum_quantity_by_price_and_order_rows` | Level 2 market depth aggregation and UI table row formatting |
+| **`test_producer.py`** | `test_create_order_schema` | Verifies Kafka message payload schema and default field injection |
+
+---
+
 ## 🏛 Cassandra NoSQL Data Modeling
 
 Apache Cassandra tables are engineered specifically for high-throughput single-partition queries:
